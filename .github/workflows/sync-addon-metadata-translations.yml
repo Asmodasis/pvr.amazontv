@@ -9,7 +9,7 @@ on:
 
 jobs:
   default:
-    if: github.repository == 'kodi-pvr/pvr.plutotv'
+    if: github.repository == 'kodi-pvr/pvr.amazontv'
     runs-on: ubuntu-latest
 
     strategy:
