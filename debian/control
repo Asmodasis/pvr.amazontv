@@ -1,0 +1,22 @@
+Source: kodi-pvr-amazontv
+Priority: extra
+Maintainer: Nobody <nobody@kodi.tv>
+Build-Depends: debhelper (>= 9.0.0), cmake,
+               kodi-addon-dev
+Standards-Version: 3.9.4
+Section: libs
+
+Package: kodi-pvr-amazontv
+Section: libs
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: Amazon PVR for Kodi
+ amazontv PVR for Kodi
+
+Package: kodi-pvr-amazontv-dbg
+Section: debug
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: debug symbols for Amazontv PVR for Kodi
+ debug symbols for Amazontv PVR for Kodi
+

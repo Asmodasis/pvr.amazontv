@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<addon
+  id="pvr.amazontv"
+  version="22.3.1"
+  name="Amazon.tv PVR Client"
+  provider-name="Team Kodi, Shawn Ray">
+  <requires>@ADDON_DEPENDS@
+    <import addon="inputstream.adaptive" minversion="22.0.0"/>
+  </requires>
+  <extension
+    point="kodi.pvrclient"
+    library_@PLATFORM@="@LIBRARY_FILENAME@"/>
+  <extension point="xbmc.addon.metadata">
+    <platform>@PLATFORM@</platform>
+    <license>GPL-2.0-or-later</license>
+    <source>https://github.com/kodi-pvr/pvr.Amazontv</source>
+    <forum>https://forum.kodi.tv/forumdisplay.php?fid=167</forum>
+    <assets>
+      <icon>icon.png</icon>
+      <screenshot>resources/screenshots/screenshot-01.jpg</screenshot>
+      <screenshot>resources/screenshots/screenshot-02.jpg</screenshot>
+      <screenshot>resources/screenshots/screenshot-03.jpg</screenshot>
+    </assets>
+    <summary lang="bs_BA">Amazon.tv PVR klijent</summary>
+    <summary lang="da_DK">Amazon.tv PVR-klient</summary>
+    <summary lang="de_DE">Amazon.tv PVR Client</summary>
+    <summary lang="en_GB">Amazon.tv PVR Client</summary>
+    <summary lang="es_ES">Cliente PVR Amazon.tv</summary>
+    <summary lang="es_MX">Cliente PVR de Amazon.tv</summary>
+    <summary lang="fi_FI">Amazon.tv PVR-pääte</summary>
+    <summary lang="fr_FR">Client PVR Amazon.tv</summary>
+    <summary lang="hr_HR">Amazon.tv PVR klijent</summary>
+    <summary lang="it_IT">Client PVR Amazon.tv</summary>
+    <summary lang="ko_KR">Amazon.tv PVR 클라이언트</summary>
+    <summary lang="pl_PL">Klient PVR Amazon.tv</summary>
+    <summary lang="pt_BR">Cliente PVR Amazon.tv</summary>
+    <summary lang="ru_RU">PVR-клиент Amazon.tv</summary>
+    <summary lang="sv_SE">Amazon.tv PVR-klient</summary>
+    <summary lang="uk_UA">PVR-клієнт Amazon.tv</summary>
+    <summary lang="zh_CN">Amazon.tv PVR 客户端</summary>
+    <description lang="bs_BA">Amazon.tv PVR klijent. Napomena: Ovo nije službeni dodatak za Amazon.tv i nije povezan s Amazon.tv. Razvili su ga volonteri.</description>
+    <description lang="da_DK">Amazon.tv PVR-klient. Bemærk: Dette er ikke et officielt Amazon.tv-add-on og er ikke relateret til Amazon.tv. Det er udviklet af frivillige.</description>
+    <description lang="de_DE">Amazon.tv PVR Client. Hinweis: Dies ist kein offizielles Amazon.tv-Addon und steht nicht in Verbindung zu Amazon.tv. Es wurde von Freiwilligen entwickelt.</description>
+    <description lang="en_GB">Amazon.tv PVR Client. Note: This is not an official Amazon.tv add-on and not related to Amazon.tv. It was developed by volunteers.</description>
+    <description lang="es_ES">Cliente PVR de Amazon.tv. Nota: Este no es un complemento oficial de Amazon.tv y no está relacionado con Amazon.tv. Fue desarrollado por voluntarios.</description>
+    <description lang="es_MX">Cliente PVR de Amazon.tv. Nota: Este no es un complemento oficial de plut.tv y no está relacionado a Amazon.tv. Ha sido desarrollado por voluntarios.</description>
+    <description lang="fi_FI">Amazon.tv PVR-pääte. Huomioi: Tämä ei ole virallinen Amazon.tv-lisäosa, eikä Amazon.tv ole osallistunut sen kehitykseen. Lisäosa on vapaaehtoisten kehittämä.</description>
+    <description lang="fr_FR">Client PVR Amazon.tv . Remarque : ceci n&apos;est pas un module complémentaire officiel de Amazon.tv et n&apos;est pas lié à Amazon.tv. Il a été développé par des bénévoles.</description>
+    <description lang="hr_HR">Amazon.tv PVR klijent. Napomena: Ovo nije službeni Amazon.tv dodatak i nije povezan s Amazon.tv. Razvijen je od strane dobrovoljaca.</description>
+    <description lang="it_IT">Client PVR Amazon.tv. Nota: questo non è un add-on ufficiale di Amazon.tv e non è correlato a Amazon.tv. È stato sviluppato da volontari.</description>
+    <description lang="ko_KR">Amazon.tv PVR 클라이언트. 참고 : 이것은 공식 Amazon.tv 애드온이 아니며 Amazon.tv와 관련이 없습니다. 자원 봉사자가 개발했습니다.</description>
+    <description lang="pl_PL">Klient PVR Amazon.tv. Uwaga: to nie jest oficjalny dodatek Amazon.tv i nie jest powiązany z Amazon.tv. Został opracowany przez wolontariuszy.</description>
+    <description lang="pt_BR">Cliente PVR Plutão.tv. Nota: Este não é um complemento oficial do Amazon.tv e não está relacionado ao Amazon.tv. Foi desenvolvido por voluntários.</description>
+    <description lang="ru_RU">PVR-клиент Amazon.tv. Примечание: это не официальное дополнение для Amazon.tv и не связано с Amazon.tv. Оно было разработано добровольцами.</description>
+    <description lang="sv_SE">Amazon.tv PVR-klient. Obs! Detta är inte ett officiellt tillägg till Amazon.tv och har ingen koppling till Amazon.tv. Det har utvecklats av frivilliga.</description>
+    <description lang="uk_UA">PVR-клієнт Amazon.tv. Примітка: це неофіційний додаток Amazon.tv і він не пов’язаний з Amazon.tv. Він був розроблений волонтерами.</description>
+    <description lang="zh_CN">Amazon.tv PVR 客户端。注意：这不是官方的 Amazon.tv 附加组件，与 Amazon.tv 无关。它是由志愿者开发的。</description>
+  </extension>
+</addon>
