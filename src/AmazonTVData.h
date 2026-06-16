@@ -221,6 +221,8 @@ private:
    */
   int ChannelUidToIndex(int uid) const;
 
+  int AmazonTVData::MapGenreToKodi(const std::string& genre);
+
   // ── State ─────────────────────────────────────────────────────────────────
 
   mutable std::mutex            m_mutex;       ///< Guards m_channels
