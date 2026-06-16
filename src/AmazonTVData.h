@@ -57,6 +57,9 @@
 
 #include <kodi/addon-instance/PVR.h>
 #include <nlohmann/json.hpp>
+#include "ClientInstance.h"
+#include "addon.cpp"
+
 
 #include <ctime>
 #include <map>
