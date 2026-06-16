@@ -99,7 +99,7 @@ struct Channel
 
 // ─── AmazonTVData ─────────────────────────────────────────────────────────────
 
-class AmazonTVData
+class AmazonTVData : public CClientInstance : public CMyAddon
 {
 public:
   // ── Lifecycle ────────────────────────────────────────────────────────────
