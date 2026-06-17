@@ -572,7 +572,9 @@ std::string AmazonLiveData::GetAccessToken()
 std::string AmazonLiveData::GetChannelsJson() const
 {
   // TODO: Update with actual Amazon Live TV API endpoint
-  std::string url{"https://www.amazon.com/gp/video/livetv/api/v1/channels"};
+  
+  std::string url{"https://www.amazon.com/gp/video/api/enrichNav?enrichmentType=GET_CHANNELS"};
+  //std::string url{"https://www.amazon.com/gp/video/livetv/api/v1/channels"};
   url += "?limit=1000";
 
   Curl curl;
@@ -609,7 +611,9 @@ std::string AmazonLiveData::GetEpgJson(time_t start, time_t end) const
   std::strftime(endTime, sizeof(endTime), "%Y-%m-%dT%H:%M:%SZ", pstm_end);
 
   // TODO: Update with actual Amazon Live TV API endpoint
-  std::string url{"https://www.amazon.com/gp/video/livetv/api/v1/epg"};
+  std::string url{"https://www.amazon.com/gp/video/api/paginateCollection?pageType=home"};
+  //std::string url{"https://www.amazon.com/gp/video/livetv/api/v1/epg"};
+
   url += "?start=" + std::string{startTime};
   url += "&end=" + std::string{endTime};
   url += "&includeMetadata=true";
