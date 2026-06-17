@@ -5,7 +5,7 @@
  *  See LICENSE.md for more information.
  */
 
-#include "AmazonLiveData.h"
+#include "AmazonTVData.h"
 
 #include "Curl.h"
 #include "Utils.h"
