@@ -52,15 +52,25 @@ namespace
       "Chrome/125.0.0.0 Safari/537.36";
 
   /// Amazon's web player tags every request with a short opaque nonce
-  /// ("nerid"). Real captured values look like base64url-ish 20-char
-  /// strings, e.g. "Z7inDb9TqVpuCH5fXnrNWj00". We can't reproduce Amazon's
-  /// exact generator, but a random string of similar shape is sufficient —
-  /// nothing in the captured responses suggests the server validates its
-  /// structure beyond "present and reasonably unique per request".
+  /// ("nerid"). Real captured values are base64-shaped but ALWAYS appear
+  /// percent-encoded in the URL (e.g. "Z7inD7mMv5pd%2B7TPrQ%2B4VU00" decodes
+  /// to "Z7inD7mMv5pd+7TPrQ+4VU00") — confirmed from HAR capture, since the
+  /// browser's base64 alphabet includes '+' and '/', both of which are not
+  /// URL-safe on their own and must be escaped or avoided.
+  ///
+  /// Rather than generate from the full base64 alphabet and have to remember
+  /// to percent-encode it at every call site, we generate directly from a
+  /// URL-safe alphabet (base64url-style, swapping '+' for '-' and '/' for
+  /// '_', which is a one-way simplification but is never decoded by us —
+  /// only ever sent and presumably read by Amazon's backend). This avoids
+  /// the previous bug where a raw '+' or '/' could land unescaped in the
+  /// query string, corrupting it (a literal '+' is read by many servers as
+  /// an encoded space) and causing the request to silently fail or return
+  /// an unexpected response instead of EPG data.
   std::string GenerateNerid()
   {
     static const char kAlphabet[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     static thread_local std::mt19937 rng(static_cast<unsigned>(
         std::chrono::steady_clock::now().time_since_epoch().count()));
     std::uniform_int_distribution<int> dist(0, sizeof(kAlphabet) - 2);
@@ -90,6 +100,35 @@ namespace
         out << '%' << std::uppercase << std::setw(2) << int(c) << std::nouppercase;
     }
     return out.str();
+  }
+
+  /// Kodi's CURL-backed VFS (kodi::vfs::CFile) reads custom request headers
+  /// from special pipe-delimited "URL options" appended after the real
+  /// query string, e.g.:
+  ///   https://host/path?real=query|Cookie=foo%3Dbar&User-Agent=MyAgent
+  /// Without this, m_sessionCookie and m_userAgent are read from settings
+  /// but never actually reach the request — which is exactly the kind of
+  /// bug that makes Amazon's backend silently reject/redirect instead of
+  /// returning real EPG JSON (no session context = unauthenticated request).
+  /// Header VALUES must themselves be URL-encoded; the '|' separator and
+  /// '&'/'=' joining the header list must NOT be encoded.
+  std::string BuildCurlHeaderOptions(const std::string& cookie, const std::string& userAgent)
+  {
+    std::string opts;
+    bool first = true;
+    auto appendHeader = [&](const char* name, const std::string& value)
+    {
+      if (value.empty())
+        return;
+      opts += first ? '|' : '&';
+      first = false;
+      opts += name;
+      opts += '=';
+      opts += UrlEncode(value);
+    };
+    appendHeader("Cookie", cookie);
+    appendHeader("User-Agent", userAgent);
+    return opts;
   }
 } // namespace
 
@@ -384,7 +423,14 @@ bool AmazonTVData::FetchStationAirings(const std::string& gti, std::string& json
   url += "&entityId=";        url += UrlEncode(gti);
   url += "&firmware=1";
   url += "&widgetScheme=pvplayer-web-v3";
-  url += "&nerid=";           url += GenerateNerid();
+  url += "&nerid=";           url += UrlEncode(GenerateNerid());
+
+  // Attach Cookie / User-Agent as Kodi VFS CURL header-options. Without
+  // this, m_sessionCookie was read from settings but never sent — the
+  // request reached Amazon with no session context, which is a likely
+  // cause of EPG data silently failing to load (server returns an
+  // unauthenticated error/redirect body instead of stationAiringsAndRestrictions).
+  url += BuildCurlHeaderOptions(m_sessionCookie, m_userAgent);
 
   kodi::vfs::CFile file;
   if (!file.OpenFile(url, ADDON_READ_NO_CACHE))
@@ -410,7 +456,16 @@ bool AmazonTVData::FetchStationAirings(const std::string& gti, std::string& json
   }
   file.Close();
 
-  return !jsonOut.empty();
+  if (jsonOut.empty())
+  {
+    kodi::Log(ADDON_LOG_WARNING,
+              "AmazonTVData: Empty response body for GTI '%s'. If this "
+              "persists, verify session_cookie is set and not expired.",
+              gti.c_str());
+    return false;
+  }
+
+  return true;
 }
 
 bool AmazonTVData::ParseStationAiringsResponse(const json& j, const std::string& gti,
@@ -556,7 +611,7 @@ bool AmazonTVData::FetchPlaybackResources(const std::string& gti, std::string& j
   url += "&uxLocale=";        url += m_uxLocale;
   url += "&firmware=1";
   url += "&titleId=";         url += UrlEncode(gti);
-  url += "&nerid=";           url += GenerateNerid();
+  url += "&nerid=";           url += UrlEncode(GenerateNerid());
 
   // The real captured POST body is a large, mostly-static JSON envelope
   // (globalParameters with an opaque "playbackEnvelope" blob, plus
@@ -574,13 +629,23 @@ bool AmazonTVData::FetchPlaybackResources(const std::string& gti, std::string& j
   body["liveLinearPlaybackUrlsRequest"]["device"]["maxVideoResolution"] = "2160p";
   const std::string postBody = body.dump();
 
+  // Also attach Cookie / User-Agent — same gap as FetchStationAirings, see
+  // comment there. Note this affects playback resolution, not EPG, but is
+  // fixed here for consistency.
+  url += BuildCurlHeaderOptions(m_sessionCookie, m_userAgent);
+
   kodi::vfs::CFile file;
-  // NOTE: kodi::vfs::CFile's OpenFileForWrite/CURL POST support varies by
-  // Kodi version; if your toolchain's CFile cannot issue a POST with a
-  // custom body directly, route this through Kodi's HTTP-over-CURL helper
-  // (kodi::network::CURLOpen-style header/postdata properties) instead.
-  // The URL, query parameters, and body shape above are what must reach
-  // the server unchanged.
+  // CAUTION (separate from the EPG bug, flagging for visibility): Kodi's
+  // kodi::vfs::CFile::OpenFileForWrite() opens a VFS write handle to create
+  // or overwrite a file at a URL — it is not guaranteed to perform an HTTP
+  // POST with the written bytes as a request body the way a real HTTP
+  // client's POST does. Whether this round-trips through CURL as a true
+  // POST depends on the specific VFS/CURL plugin behavior in your Kodi
+  // build, and has NOT been verified against a real request. If
+  // GetChannelStreamProperties fails or returns no manifest URL, this is
+  // the first place to investigate — likely needs to be replaced with
+  // Kodi's lower-level CURL POST mechanism (custom_curl_post / postdata
+  // URL-option) rather than the OpenFileForWrite+OpenFile pattern below.
   if (!file.OpenFileForWrite(url, true))
   {
     kodi::Log(ADDON_LOG_ERROR,
