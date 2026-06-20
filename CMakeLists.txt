@@ -10,12 +10,13 @@ include_directories(${KODI_INCLUDE_DIR}/.. # Hack way with "/..", need bigger Ko
 		    ${NLOHMANNJSON_INCLUDE_DIRS})
 
 set(PVRAMAZON_SOURCES
-                    src/addon.cpp
-                    src/ClientInstance.cpp
+                    src/Curl.cpp
+                    src/Utils.cpp
                     src/AmazonTVData.cpp)
 
 set(PVRAMAZON_HEADERS
-                    src/ClientInstance.h
+                    src/Curl.h
+                    src/Utils.h
                     src/AmazonTVData.h)
 
 addon_version(pvr.amazontv IPTV)
