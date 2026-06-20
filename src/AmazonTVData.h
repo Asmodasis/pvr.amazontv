@@ -1,8 +1,8 @@
 /*
- *  Copyright (C) 2024 Amazon Live TV PVR add-on
+ *  Amazon Live TV PVR Client for Kodi (unofficial)
+ *  Adapted from pvr.plutotv by flubshi / Team Kodi
  *
  *  SPDX-License-Identifier: GPL-2.0-or-later
- *  See LICENSE.md for more information.
  */
 
 #pragma once
@@ -13,12 +13,11 @@
 #include <chrono>
 #include <memory>
 #include <vector>
+#include <string>
 
-/**
- * User Agent for HTTP Requests
- */
-static const std::string AMAZON_LIVE_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                                                  "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
+static const std::string AMAZON_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                             "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                             "Chrome/148.0.0.0 Safari/537.36 OPR/132.0.0.0";
 
 class ATTR_DLL_LOCAL AmazonLiveData : public kodi::addon::CAddonBase,
                                       public kodi::addon::CInstancePVRClient
@@ -45,6 +44,7 @@ public:
   PVR_ERROR GetChannelGroups(bool radio, kodi::addon::PVRChannelGroupsResultSet& results) override;
   PVR_ERROR GetChannelGroupMembers(const kodi::addon::PVRChannelGroup& group,
                                    kodi::addon::PVRChannelGroupMembersResultSet& results) override;
+
   PVR_ERROR GetChannelStreamProperties(
       const kodi::addon::PVRChannel& channel,
       PVR_SOURCE source,
@@ -58,35 +58,33 @@ public:
 private:
   struct AmazonChannel
   {
-    int iUniqueId;
-    std::string amazonChannelId;
-    int iChannelNumber; // position
-    std::string strChannelName;
-    std::string strIconPath;
-    std::string strStreamURL;
+    int iUniqueId = 0;
+    std::string titleId;           // e.g. amzn1.dv.gti.21cc7811-...
+    std::string consumptionId;
+    std::string channelName;
+    std::string iconPath;
+    std::string manifestUrl;       // DASH MPD
+    std::string token;             // short-lived signed token
   };
-
-  std::shared_ptr<nlohmann::json> m_epg_cache_document;
-  time_t m_epg_cache_start = time_t(0);
-  time_t m_epg_cache_end = time_t(0);
 
   std::vector<AmazonChannel> m_channels;
   bool m_bChannelsLoaded = false;
 
-  std::string GetChannelStreamURL(int uniqueId);
-  std::string GetSettingsUUID(const std::string& setting);
-  int GetSettingsStartChannel() const;
-  bool GetSettingsColoredChannelLogos() const;
-  bool GetSettingsWorkaroundBrokenStreams() const;
+  // Settings helpers (add more in settings.xml later)
+  std::string GetSettingsDeviceId() const;
+  bool GetSettingsUseTelemetry() const;
+
   void SetStreamProperties(std::vector<kodi::addon::PVRStreamProperty>& properties,
-                           const std::string& url,
+                           const std::string& manifestUrl,
                            bool realtime);
+
   bool LoadChannelsData();
+  std::string GetChannelStreamURL(int uniqueId);
 
-  std::string GetAccessToken();
-  std::string GetChannelsJson() const;
-  std::string GetEpgJson(time_t start, time_t end) const;
+  // API Helpers from HAR
+  std::string FetchManifest(const std::string& titleId, const std::string& consumptionId);
+  bool SendTelemetry(const std::string& playhead, const std::string& consumptionId);
 
-  std::string m_accessToken;
-  std::chrono::time_point<std::chrono::steady_clock> m_tokenTimestamp;
+  std::string m_deviceId;
+  std::chrono::time_point<std::chrono::steady_clock> m_lastTokenTime;
 };
