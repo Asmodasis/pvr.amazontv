@@ -3,7 +3,7 @@
  *  Adapted from pvr.plutotv
  */
 
-#include "AmazonTVData.h"
+#include "AmazonLiveTV.h"
 #include "Curl.h"
 #include "Utils.h"
 #include "kodi/tools/StringUtils.h"
