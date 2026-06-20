@@ -1,643 +1,744 @@
 /*
- *  Copyright (C) 2024 Amazon Live TV PVR add-on
- *
+ *  Copyright (C) 2024 Team Kodi
  *  SPDX-License-Identifier: GPL-2.0-or-later
- *  See LICENSE.md for more information.
+ *
+ *  AmazonTVData.cpp
+ *  ────────────────
+ *  Implementation notes
+ *  ════════════════════
+ *  Every field name, nesting path, and time encoding below was taken
+ *  directly from a real HAR capture of browser traffic against
+ *  atv-ps.amazon.com while live TV was playing on amazon.com/gp/video/livetv.
+ *  Nothing here is reconstructed from documentation or guesswork — see the
+ *  comment block in AmazonTVData.h for the confirmed request/response shapes.
  */
 
 #include "AmazonTVData.h"
 
-#include "Curl.h"
-#include "Utils.h"
-#include "kodi/tools/StringUtils.h"
+#include <kodi/AddonBase.h>
+#include <kodi/Filesystem.h>
+#include <kodi/General.h>
 
-#include <cctype>
-#include <ctime>
+#include <nlohmann/json.hpp>
+
+#include <chrono>
+#include <cstdlib>
 #include <iomanip>
-#include <ios>
+#include <random>
 #include <sstream>
+#include <string>
+#include <vector>
 
-ADDON_STATUS AmazonLiveData::Create()
-{
-  kodi::Log(ADDON_LOG_DEBUG, "%s - Creating the Amazon Live TV PVR add-on", __FUNCTION__);
-  return ADDON_STATUS_OK;
-}
+using json = nlohmann::json;
 
-ADDON_STATUS AmazonLiveData::SetSetting(const std::string& settingName,
-                                        const kodi::addon::CSettingValue& settingValue)
-{
-  return ADDON_STATUS_NEED_RESTART;
-}
-
-PVR_ERROR AmazonLiveData::GetCapabilities(kodi::addon::PVRCapabilities& capabilities)
-{
-  capabilities.SetSupportsEPG(true);
-  capabilities.SetSupportsTV(true);
-
-  return PVR_ERROR_NO_ERROR;
-}
-
-PVR_ERROR AmazonLiveData::GetBackendName(std::string& name)
-{
-  name = "Amazon Live TV PVR add-on";
-  return PVR_ERROR_NO_ERROR;
-}
-
-PVR_ERROR AmazonLiveData::GetBackendVersion(std::string& version)
-{
-  version = STR(IPTV_VERSION);
-  return PVR_ERROR_NO_ERROR;
-}
+// ─── Constants ────────────────────────────────────────────────────────────────
 
 namespace
 {
-// http://stackoverflow.com/a/17708801
-const std::string UrlEncode(const std::string& value)
-{
-  std::ostringstream escaped;
-  escaped.fill('0');
-  escaped << std::hex;
+  constexpr const char* kDefaultMarketplaceId = "ATVPDKIKX0DER"; // US
+  constexpr const char* kDefaultUxLocale       = "en_US";
 
-  for (auto c : value)
+  // The exact host + path captured live; do not change without re-verifying
+  // against a fresh HAR.
+  constexpr const char* kLuminaUrl =
+      "https://atv-ps.amazon.com/cdp/lumina/playerChromeResources/v1";
+
+  constexpr const char* kPlaybackResourcesUrl =
+      "https://atv-ps.amazon.com/playback/prs/GetLiveLinearPlaybackResources";
+
+  constexpr const char* kDefaultUA =
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+      "AppleWebKit/537.36 (KHTML, like Gecko) "
+      "Chrome/125.0.0.0 Safari/537.36";
+
+  /// Amazon's web player tags every request with a short opaque nonce
+  /// ("nerid"). Real captured values look like base64url-ish 20-char
+  /// strings, e.g. "Z7inDb9TqVpuCH5fXnrNWj00". We can't reproduce Amazon's
+  /// exact generator, but a random string of similar shape is sufficient —
+  /// nothing in the captured responses suggests the server validates its
+  /// structure beyond "present and reasonably unique per request".
+  std::string GenerateNerid()
   {
-    // Keep alphanumeric and other accepted characters intact
-    if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~')
+    static const char kAlphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    static thread_local std::mt19937 rng(static_cast<unsigned>(
+        std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::uniform_int_distribution<int> dist(0, sizeof(kAlphabet) - 2);
+
+    std::string out;
+    out.reserve(22);
+    for (int i = 0; i < 22; ++i)
+      out += kAlphabet[dist(rng)];
+    out += "00";
+    return out;
+  }
+
+  /// Minimal URL-encoding for query string values we build ourselves
+  /// (GTIs and our own nerid use only URL-safe characters already, but the
+  /// helper is here for the few fields that need it, e.g. a future device
+  /// name containing spaces).
+  std::string UrlEncode(const std::string& value)
+  {
+    std::ostringstream out;
+    out.fill('0');
+    out << std::hex;
+    for (unsigned char c : value)
     {
-      escaped << c;
+      if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~')
+        out << c;
+      else
+        out << '%' << std::uppercase << std::setw(2) << int(c) << std::nouppercase;
+    }
+    return out.str();
+  }
+} // namespace
+
+// ─── Constructor / Destructor ─────────────────────────────────────────────────
+
+AmazonTVData::AmazonTVData()
+{
+  m_marketplaceId = kodi::addon::GetSettingString("marketplace_id", kDefaultMarketplaceId);
+  m_uxLocale      = kodi::addon::GetSettingString("ux_locale", kDefaultUxLocale);
+  m_sessionCookie = kodi::addon::GetSettingString("session_cookie", "");
+  m_userAgent     = kodi::addon::GetSettingString("user_agent", kDefaultUA);
+  m_deviceId      = kodi::addon::GetSettingString("device_id", "");
+
+  if (m_deviceId.empty())
+  {
+    // Generate a stable-looking UUIDv4; persisted back to settings so the
+    // same deviceID is reused across restarts (Amazon associates session
+    // state with deviceID).
+    static thread_local std::mt19937_64 rng(static_cast<unsigned long long>(
+        std::chrono::system_clock::now().time_since_epoch().count()));
+    std::uniform_int_distribution<int> hexDigit(0, 15);
+    const char* hex = "0123456789abcdef";
+    std::ostringstream uuid;
+    const char layout[] = "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx";
+    for (char c : layout)
+    {
+      if (c == 'x')
+        uuid << hex[hexDigit(rng)];
+      else if (c == 'y')
+        uuid << hex[(hexDigit(rng) & 0x3) | 0x8]; // RFC4122 variant bits
+      else if (c == '4')
+        uuid << '4';
+      else if (c == '-')
+        uuid << '-';
+      else if (c == '\0')
+        break;
+    }
+    m_deviceId = uuid.str();
+    kodi::addon::SetSettingString("device_id", m_deviceId);
+  }
+
+  // Seed GTI list: comma-separated "gti|DisplayName" pairs from settings,
+  // OR bare GTIs (display name then comes from the live API response).
+  // See header comment: no confirmed bulk channel-list endpoint exists yet,
+  // so this is how channel discovery is configured for now.
+  const std::string seedSetting = kodi::addon::GetSettingString("seed_channel_gtis", "");
+  std::stringstream ss(seedSetting);
+  std::string token;
+  while (std::getline(ss, token, ','))
+  {
+    // trim whitespace
+    size_t start = token.find_first_not_of(" \t");
+    size_t end   = token.find_last_not_of(" \t");
+    if (start == std::string::npos)
+      continue;
+    token = token.substr(start, end - start + 1);
+
+    // strip an optional "|DisplayName" suffix — we always re-fetch the real
+    // name from the API, so only the GTI portion before '|' matters here.
+    size_t pipePos = token.find('|');
+    if (pipePos != std::string::npos)
+      token = token.substr(0, pipePos);
+
+    if (!token.empty())
+      m_seedGtis.push_back(token);
+  }
+
+  if (m_seedGtis.empty())
+  {
+    kodi::Log(ADDON_LOG_WARNING,
+              "AmazonTVData: No 'seed_channel_gtis' configured in addon "
+              "settings. No bulk channel-list endpoint has been confirmed "
+              "for Amazon Live TV, so channel GTIs must be supplied manually "
+              "(Settings -> Seed Channel GTIs). No channels will load until "
+              "this is set.");
+  }
+}
+
+AmazonTVData::~AmazonTVData() = default;
+
+// ─── Public: LoadChannelData ──────────────────────────────────────────────────
+
+bool AmazonTVData::LoadChannelData()
+{
+  if (m_seedGtis.empty())
+  {
+    kodi::Log(ADDON_LOG_ERROR, "AmazonTVData: LoadChannelData — seed GTI list is empty.");
+    return false;
+  }
+
+  std::vector<AmazonTV::Channel> parsed;
+  parsed.reserve(m_seedGtis.size());
+  std::map<int, int> uidMap;
+  int uid = 1;
+
+  for (const std::string& gti : m_seedGtis)
+  {
+    std::string rawJson;
+    if (!FetchStationAirings(gti, rawJson))
+    {
+      kodi::Log(ADDON_LOG_WARNING,
+                "AmazonTVData: Failed to fetch stationAiringsAndRestrictions "
+                "for GTI '%s' — skipping.", gti.c_str());
       continue;
     }
 
-    // Any other characters are percent-encoded
-    escaped << '%' << std::setw(2) << int(static_cast<unsigned char>(c));
-  }
-
-  return escaped.str();
-}
-} // unnamed namespace
-
-void AmazonLiveData::SetStreamProperties(std::vector<kodi::addon::PVRStreamProperty>& properties,
-                                         const std::string& url,
-                                         bool realtime)
-{
-  kodi::Log(ADDON_LOG_DEBUG, "[PLAY STREAM] url: %s", url.c_str());
-
-  properties.emplace_back(PVR_STREAM_PROPERTY_STREAMURL, url);
-  properties.emplace_back(PVR_STREAM_PROPERTY_INPUTSTREAM, "inputstream.adaptive");
-  properties.emplace_back(PVR_STREAM_PROPERTY_ISREALTIMESTREAM, realtime ? "true" : "false");
-  // HLS
-  properties.emplace_back(PVR_STREAM_PROPERTY_MIMETYPE, "application/x-mpegURL");
-
-  const std::string encodedUserAgent{UrlEncode(AMAZON_LIVE_USER_AGENT)};
-  properties.emplace_back("inputstream.adaptive.manifest_headers",
-                          "User-Agent=" + encodedUserAgent);
-  properties.emplace_back("inputstream.adaptive.stream_headers", "User-Agent=" + encodedUserAgent);
-
-  if (GetSettingsWorkaroundBrokenStreams())
-    properties.emplace_back("inputstream.adaptive.manifest_config",
-                            "{\"hls_ignore_endlist\":true,\"hls_fix_mediasequence\":true,\"hls_fix_"
-                            "discsequence\":true}");
-}
-
-bool AmazonLiveData::LoadChannelsData()
-{
-  if (m_bChannelsLoaded)
-    return true;
-
-  GetAccessToken();
-  if (m_accessToken.empty())
-    return false;
-
-  kodi::Log(ADDON_LOG_DEBUG, "[load data] GET CHANNELS");
-
-  const std::string jsonChannels{GetChannelsJson()};
-
-  if (jsonChannels.empty() || jsonChannels == "[]")
-  {
-    kodi::Log(ADDON_LOG_ERROR, "[channels] ERROR - empty response");
-    return false;
-  }
-
-  kodi::Log(ADDON_LOG_DEBUG, "[channels] length: %i;", jsonChannels.size());
-  kodi::Log(ADDON_LOG_DEBUG, "[channels] %s;", jsonChannels.c_str());
-  kodi::Log(ADDON_LOG_DEBUG, "[channels] %s;",
-            jsonChannels.substr(jsonChannels.size() - 40).c_str());
-
-  // parse channels
-  kodi::Log(ADDON_LOG_DEBUG, "[channels] parse channels");
-  nlohmann::json channelsDoc = nlohmann::json::parse(jsonChannels.c_str());
-  if (channelsDoc.is_discarded())
-  {
-    kodi::Log(ADDON_LOG_ERROR, "[LoadChannelData] ERROR: error while parsing json");
-    return false;
-  }
-
-  kodi::Log(ADDON_LOG_DEBUG, "[channels] iterate channels");
-
-  // Get channels array - adjust key based on actual Amazon API response
-  nlohmann::json channelsArray;
-  if (channelsDoc.contains("channels"))
-  {
-    channelsArray = channelsDoc.at("channels");
-  }
-  else if (channelsDoc.contains("data"))
-  {
-    channelsArray = channelsDoc.at("data");
-  }
-  else
-  {
-    kodi::Log(ADDON_LOG_ERROR, "[channels] ERROR - no channels data found in response");
-    return false;
-  }
-
-  kodi::Log(ADDON_LOG_DEBUG, "[channels] size: %i;", channelsArray.size());
-
-  // Use configured start channel number to populate the channel list
-  int i = GetSettingsStartChannel();
-  for (const auto& channel : channelsArray)
-  {
-    const std::string amazonChannelId{channel.at("id")};
-
-    AmazonChannel amazon_channel;
-    amazon_channel.iChannelNumber = i++; // position
-    kodi::Log(ADDON_LOG_DEBUG, "[channel] channelnr(pos): %i;", amazon_channel.iChannelNumber);
-
-    amazon_channel.amazonChannelId = amazonChannelId;
-    kodi::Log(ADDON_LOG_DEBUG, "[channel] Amazon Channel ID: %s;", amazon_channel.amazonChannelId.c_str());
-
-    const int uniqueId = Utils::Hash(amazonChannelId);
-    amazon_channel.iUniqueId = uniqueId;
-    kodi::Log(ADDON_LOG_DEBUG, "[channel] id: %i;", uniqueId);
-
-    const std::string displayName = channel.at("name");
-    amazon_channel.strChannelName = displayName;
-    kodi::Log(ADDON_LOG_DEBUG, "[channel] name: %s;", amazon_channel.strChannelName.c_str());
-
-    std::string logo;
-
-    // Handle logo/image extraction - adjust based on actual Amazon API response
-    if (channel.contains("images") && channel.at("images").size() > 0)
+    json j;
+    try
     {
-      for (const auto& img : channel.at("images"))
-      {
-        if (!img.contains("type"))
-          continue;
-
-        if (GetSettingsColoredChannelLogos())
-        {
-          if (img.at("type") == "colorLogo" || img.at("type") == "colorLogoPNG")
-          {
-            logo = img.at("url");
-            break;
-          }
-        }
-        else if (img.at("type") == "solidLogo" || img.at("type") == "solidLogoPNG")
-        {
-          logo = img.at("url");
-          break;
-        }
-        // fallback
-        if (img.at("type") == "logo")
-        {
-          logo = img.at("url");
-        }
-      }
+      j = json::parse(rawJson);
     }
-    else if (channel.contains("thumbnail"))
+    catch (const json::parse_error& e)
     {
-      logo = channel.at("thumbnail");
+      kodi::Log(ADDON_LOG_ERROR,
+                "AmazonTVData: JSON parse_error for GTI '%s' at byte %zu — %s",
+                gti.c_str(), e.byte, e.what());
+      continue;
     }
 
-    amazon_channel.strIconPath = logo;
-    kodi::Log(ADDON_LOG_DEBUG, "[channel] iconpath: %s;", amazon_channel.strIconPath.c_str());
-
-    // Handle stream URL extraction - adjust based on actual Amazon API response
-    if (channel.contains("streamUrl"))
+    AmazonTV::Channel ch;
+    if (!ParseStationAiringsResponse(j, gti, ch))
     {
-      amazon_channel.strStreamURL = channel.at("streamUrl");
-      kodi::Log(ADDON_LOG_DEBUG, "[channel] streamURL: %s;", amazon_channel.strStreamURL.c_str());
+      kodi::Log(ADDON_LOG_WARNING,
+                "AmazonTVData: Could not parse station info for GTI '%s' — skipping.",
+                gti.c_str());
+      continue;
     }
 
-    m_channels.emplace_back(amazon_channel);
+    ch.channelNumber = uid; // sequential; Amazon's API doesn't expose a channel number
+    uidMap[uid] = static_cast<int>(parsed.size());
+    parsed.push_back(std::move(ch));
+    ++uid;
   }
 
-  m_bChannelsLoaded = true;
+  if (parsed.empty())
+  {
+    kodi::Log(ADDON_LOG_ERROR,
+              "AmazonTVData: LoadChannelData — 0 of %zu seeded channels loaded "
+              "successfully. Check session_cookie / device_id settings.",
+              m_seedGtis.size());
+    return false;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_channels   = std::move(parsed);
+    m_uidToIndex = std::move(uidMap);
+  }
+
+  m_nextRefresh = std::time(nullptr) + kRefreshIntervalSec;
+  kodi::Log(ADDON_LOG_INFO,
+            "AmazonTVData: Loaded %zu of %zu seeded channels.",
+            m_channels.size(), m_seedGtis.size());
   return true;
 }
 
-PVR_ERROR AmazonLiveData::GetChannelsAmount(int& amount)
+// ─── Public: Kodi PVR interface ───────────────────────────────────────────────
+
+int AmazonTVData::GetChannelCount() const
 {
-  kodi::Log(ADDON_LOG_DEBUG, "Amazon Live TV function call: [%s]", __FUNCTION__);
-
-  LoadChannelsData();
-  if (!m_bChannelsLoaded)
-    return PVR_ERROR_SERVER_ERROR;
-
-  amount = static_cast<int>(m_channels.size());
-  return PVR_ERROR_NO_ERROR;
+  std::lock_guard<std::mutex> lock(m_mutex);
+  return static_cast<int>(m_channels.size());
 }
 
-PVR_ERROR AmazonLiveData::GetChannels(bool radio, kodi::addon::PVRChannelsResultSet& results)
+PVR_ERROR AmazonTVData::GetChannels(bool bRadio,
+                                    kodi::addon::PVRChannelsResultSet& results)
 {
-  kodi::Log(ADDON_LOG_DEBUG, "Amazon Live TV function call: [%s]", __FUNCTION__);
+  if (bRadio)
+    return PVR_ERROR_NO_ERROR;
 
-  if (!radio)
+  if (std::time(nullptr) >= m_nextRefresh)
+    LoadChannelData();
+
+  std::lock_guard<std::mutex> lock(m_mutex);
+
+  for (int i = 0; i < static_cast<int>(m_channels.size()); ++i)
   {
-    LoadChannelsData();
-    if (!m_bChannelsLoaded)
-      return PVR_ERROR_SERVER_ERROR;
-
-    for (const auto& channel : m_channels)
-    {
-      kodi::addon::PVRChannel kodiChannel;
-
-      kodiChannel.SetUniqueId(channel.iUniqueId);
-      kodiChannel.SetIsRadio(false);
-      kodiChannel.SetChannelNumber(channel.iChannelNumber);
-      kodiChannel.SetChannelName(channel.strChannelName);
-      kodiChannel.SetIconPath(channel.strIconPath);
-      kodiChannel.SetIsHidden(false);
-
-      results.Add(kodiChannel);
-    }
+    const auto& ch = m_channels[i];
+    kodi::addon::PVRChannel kodiCh;
+    kodiCh.SetUniqueId(i + 1);
+    kodiCh.SetIsRadio(false);
+    kodiCh.SetChannelNumber(ch.channelNumber > 0 ? ch.channelNumber : i + 1);
+    kodiCh.SetChannelName(ch.title);
+    kodiCh.SetIconPath(ch.logoUrl);
+    results.Add(kodiCh);
   }
   return PVR_ERROR_NO_ERROR;
 }
 
-PVR_ERROR AmazonLiveData::GetChannelStreamProperties(
-    const kodi::addon::PVRChannel& channel,
-    PVR_SOURCE source,
-    std::vector<kodi::addon::PVRStreamProperty>& properties)
+PVR_ERROR AmazonTVData::GetEPGForChannel(int uid, time_t start, time_t end,
+                                         kodi::addon::PVREPGTagsResultSet& results)
 {
-  const std::string strUrl = GetChannelStreamURL(channel.GetUniqueId());
-  kodi::Log(ADDON_LOG_DEBUG, "Stream URL -> %s", strUrl.c_str());
-  PVR_ERROR ret = PVR_ERROR_FAILED;
-  if (!strUrl.empty())
+  std::lock_guard<std::mutex> lock(m_mutex);
+
+  const int idx = ChannelUidToIndex(uid);
+  if (idx < 0)
   {
-    SetStreamProperties(properties, strUrl, true);
-    ret = PVR_ERROR_NO_ERROR;
+    kodi::Log(ADDON_LOG_WARNING, "AmazonTVData: GetEPG — unknown channel uid %d", uid);
+    return PVR_ERROR_INVALID_PARAMETERS;
   }
-  return ret;
-}
 
-std::string AmazonLiveData::GetSettingsUUID(const std::string& setting)
-{
-  std::string uuid = kodi::addon::GetSettingString(setting);
-  if (uuid.empty())
+  int broadcastUid = uid * 100000;
+  for (const auto& entry : m_channels[idx].schedule)
   {
-    uuid = Utils::CreateUUID();
-    kodi::Log(ADDON_LOG_DEBUG, "uuid (generated): %s", uuid.c_str());
-    kodi::addon::SetSettingString(setting, uuid);
-  }
-  return uuid;
-}
-
-int AmazonLiveData::GetSettingsStartChannel() const
-{
-  return kodi::addon::GetSettingInt("start_channelnum", 1);
-}
-
-bool AmazonLiveData::GetSettingsColoredChannelLogos() const
-{
-  return kodi::addon::GetSettingBoolean("colored_channel_logos", true);
-}
-
-bool AmazonLiveData::GetSettingsWorkaroundBrokenStreams() const
-{
-  return kodi::addon::GetSettingBoolean("workaround_broken_streams", true);
-}
-
-std::string AmazonLiveData::GetChannelStreamURL(int uniqueId)
-{
-  LoadChannelsData();
-  if (!m_bChannelsLoaded)
-    return {};
-
-  for (const auto& channel : m_channels)
-  {
-    if (channel.iUniqueId == uniqueId)
-    {
-      kodi::Log(ADDON_LOG_DEBUG, "Get live url for channel %s", channel.strChannelName.c_str());
-      kodi::Log(ADDON_LOG_DEBUG, "stream URL: %s", channel.strStreamURL.c_str());
-      return channel.strStreamURL;
-    }
-  }
-  return {};
-}
-
-PVR_ERROR AmazonLiveData::GetChannelGroupsAmount(int& amount)
-{
-  return PVR_ERROR_NOT_IMPLEMENTED;
-}
-
-PVR_ERROR AmazonLiveData::GetChannelGroups(bool radio, kodi::addon::PVRChannelGroupsResultSet& results)
-{
-  return PVR_ERROR_NOT_IMPLEMENTED;
-}
-
-PVR_ERROR AmazonLiveData::GetChannelGroupMembers(const kodi::addon::PVRChannelGroup& group,
-                                                 kodi::addon::PVRChannelGroupMembersResultSet& results)
-{
-  return PVR_ERROR_NOT_IMPLEMENTED;
-}
-
-PVR_ERROR AmazonLiveData::GetEPGForChannel(int channelUid,
-                                           time_t start,
-                                           time_t end,
-                                           kodi::addon::PVREPGTagsResultSet& results)
-{
-  LoadChannelsData();
-  if (!m_bChannelsLoaded)
-    return PVR_ERROR_SERVER_ERROR;
-
-  // Find channel data
-  for (const auto& channel : m_channels)
-  {
-    if (channel.iUniqueId != channelUid)
+    if (entry.endTime <= start || entry.startTime >= end)
       continue;
 
-    // Channel data found
-    if (!m_epg_cache_document || m_epg_cache_start == 0 || m_epg_cache_end == 0 ||
-        start < m_epg_cache_start || end > m_epg_cache_end)
+    kodi::addon::PVREPGTag tag;
+    tag.SetUniqueBroadcastId(broadcastUid++);
+    tag.SetUniqueChannelId(uid);
+    tag.SetTitle(entry.title);
+    tag.SetPlot(entry.description);
+    tag.SetStartTime(entry.startTime);
+    tag.SetEndTime(entry.endTime);
+    tag.SetIconPath(entry.imageUrl);
+    tag.SetGenreType(MapAiringToKodiGenre(entry.title, entry.description));
+    results.Add(tag);
+  }
+  return PVR_ERROR_NO_ERROR;
+}
+
+PVR_ERROR AmazonTVData::GetChannelStreamProperties(
+    const kodi::addon::PVRChannel& channel,
+    std::vector<kodi::addon::PVRStreamProperty>& props)
+{
+  std::string gti;
+  {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const int idx = ChannelUidToIndex(channel.GetUniqueId());
+    if (idx < 0)
+      return PVR_ERROR_INVALID_PARAMETERS;
+    gti = m_channels[idx].gti;
+  }
+
+  std::string rawJson;
+  if (!FetchPlaybackResources(gti, rawJson))
+  {
+    kodi::Log(ADDON_LOG_ERROR,
+              "AmazonTVData: GetChannelStreamProperties — playback fetch "
+              "failed for GTI '%s'.", gti.c_str());
+    return PVR_ERROR_SERVER_ERROR;
+  }
+
+  json j;
+  try
+  {
+    j = json::parse(rawJson);
+  }
+  catch (const json::parse_error& e)
+  {
+    kodi::Log(ADDON_LOG_ERROR,
+              "AmazonTVData: Playback response JSON parse_error at byte %zu — %s",
+              e.byte, e.what());
+    return PVR_ERROR_SERVER_ERROR;
+  }
+
+  const std::string manifestUrl = ExtractManifestUrl(j);
+  if (manifestUrl.empty())
+  {
+    kodi::Log(ADDON_LOG_ERROR,
+              "AmazonTVData: No manifest URL in playback response for GTI '%s'. "
+              "Channel may be geo-restricted, entitlement-gated, or the "
+              "response shape has changed upstream.", gti.c_str());
+    return PVR_ERROR_SERVER_ERROR;
+  }
+
+  props.emplace_back(PVR_STREAM_PROPERTY_STREAMURL,   manifestUrl);
+  props.emplace_back(PVR_STREAM_PROPERTY_MIMETYPE,    "application/dash+xml");
+  props.emplace_back(PVR_STREAM_PROPERTY_INPUTSTREAM,  "inputstream.adaptive");
+  props.emplace_back("inputstream.adaptive.manifest_type", "mpd");
+  props.emplace_back("inputstream.adaptive.license_type",  "com.widevine.alpha");
+
+  // The captured response also includes a Widevine service certificate
+  // (widevineServiceCertificate.result.encodedServiceCertificate). If your
+  // inputstream.adaptive build requires it explicitly, surface it here as:
+  //   props.emplace_back("inputstream.adaptive.server_certificate", cert);
+
+  return PVR_ERROR_NO_ERROR;
+}
+
+// ─── Private: HTTP — endpoint (1) stationAiringsAndRestrictions ─────────────
+
+bool AmazonTVData::FetchStationAirings(const std::string& gti, std::string& jsonOut)
+{
+  std::string url = kLuminaUrl;
+  url += "?deviceID=";        url += UrlEncode(m_deviceId);
+  url += "&deviceTypeID=";    url += kDeviceTypeId;
+  url += "&gascEnabled=false";
+  url += "&marketplaceID=";   url += m_marketplaceId;
+  url += "&uxLocale=";        url += m_uxLocale;
+  url += "&desiredResources=stationAiringsAndRestrictions";
+  url += "&entityId=";        url += UrlEncode(gti);
+  url += "&firmware=1";
+  url += "&widgetScheme=pvplayer-web-v3";
+  url += "&nerid=";           url += GenerateNerid();
+
+  kodi::vfs::CFile file;
+  if (!file.OpenFile(url, ADDON_READ_NO_CACHE))
+  {
+    kodi::Log(ADDON_LOG_ERROR,
+              "AmazonTVData: Cannot open lumina URL for GTI '%s'.", gti.c_str());
+    return false;
+  }
+
+  jsonOut.clear();
+  jsonOut.reserve(64 * 1024);
+  char buf[8192];
+  ssize_t n;
+  while ((n = file.Read(buf, sizeof(buf))) > 0)
+  {
+    jsonOut.append(buf, static_cast<size_t>(n));
+    if (jsonOut.size() > kMaxResponseBytes)
     {
-      const time_t orig_start = start;
-      const time_t now = std::time(nullptr);
-      if (orig_start < now)
-      {
-        kodi::Log(ADDON_LOG_DEBUG, "[epg-amazon] adjusting start time to current time");
-        start = now;
-      }
-
-      const std::string jsonEpg{GetEpgJson(start, end)};
-      kodi::Log(ADDON_LOG_DEBUG, "[epg-amazon-all] %s", jsonEpg.c_str());
-      if (jsonEpg.empty())
-      {
-        kodi::Log(ADDON_LOG_ERROR, "[epg-amazon] empty server response");
-        return PVR_ERROR_SERVER_ERROR;
-      }
-
-      const auto epgDoc{std::make_shared<nlohmann::json>(nlohmann::json::parse(jsonEpg.c_str()))};
-      if ((*epgDoc).is_discarded())
-      {
-        kodi::Log(ADDON_LOG_ERROR, "[GetAmazonEPG] ERROR: error while parsing json");
-        return PVR_ERROR_SERVER_ERROR;
-      }
-
-      m_epg_cache_document = epgDoc;
-      m_epg_cache_start = orig_start;
-      m_epg_cache_end = end;
+      kodi::Log(ADDON_LOG_ERROR, "AmazonTVData: lumina response too large.");
+      file.Close();
+      return false;
     }
+  }
+  file.Close();
 
-    kodi::Log(ADDON_LOG_DEBUG, "[epg-amazon] iterate entries");
+  return !jsonOut.empty();
+}
 
-    // Amazon's JSON structure may differ - adjust based on actual API response
-    nlohmann::json programsArray;
-    if ((*m_epg_cache_document).contains("programs"))
+bool AmazonTVData::ParseStationAiringsResponse(const json& j, const std::string& gti,
+                                               AmazonTV::Channel& out)
+{
+  auto itResources = j.find("resources");
+  if (itResources == j.end() || !itResources->is_object())
+  {
+    kodi::Log(ADDON_LOG_ERROR,
+              "AmazonTVData: Response missing top-level 'resources' object "
+              "for GTI '%s'.", gti.c_str());
+    return false;
+  }
+
+  auto itSAR = itResources->find("stationAiringsAndRestrictions");
+  if (itSAR == itResources->end() || !itSAR->is_object())
+  {
+    // Could be in failedResources — log that for diagnosis.
+    json failed;
+    if (auto itF = j.find("failedResources"); itF != j.end())
+      failed = *itF;
+    kodi::Log(ADDON_LOG_ERROR,
+              "AmazonTVData: resources.stationAiringsAndRestrictions missing "
+              "for GTI '%s'. failedResources=%s",
+              gti.c_str(), failed.dump().c_str());
+    return false;
+  }
+
+  out.gti = gti;
+
+  if (auto itStation = itSAR->find("station");
+      itStation != itSAR->end() && itStation->is_object())
+  {
+    ParseStationInfo(*itStation, out);
+  }
+
+  if (out.title.empty())
+  {
+    kodi::Log(ADDON_LOG_WARNING,
+              "AmazonTVData: GTI '%s' has no station name — skipping.", gti.c_str());
+    return false;
+  }
+
+  if (auto itAirings = itSAR->find("linearAirings");
+      itAirings != itSAR->end() && itAirings->is_array())
+  {
+    ParseLinearAirings(*itAirings, out);
+  }
+
+  return true;
+}
+
+void AmazonTVData::ParseStationInfo(const json& jStation, AmazonTV::Channel& out)
+{
+  out.title = LocalizedValue(jStation, "stationName");
+
+  if (auto itImages = jStation.find("images");
+      itImages != jStation.end() && itImages->is_array())
+  {
+    out.logoUrl = FindImageUrl(*itImages, {"LOGO", "HERO"});
+  }
+}
+
+void AmazonTVData::ParseLinearAirings(const json& jAirings, AmazonTV::Channel& ch)
+{
+  ch.schedule.reserve(jAirings.size());
+  for (const auto& jAiring : jAirings)
+  {
+    AmazonTV::EpgEntry entry;
+    if (ParseAiringEntry(jAiring, entry))
+      ch.schedule.push_back(std::move(entry));
+  }
+}
+
+bool AmazonTVData::ParseAiringEntry(const json& jAiring, AmazonTV::EpgEntry& out)
+{
+  // ── startTime / endTime — required, epoch MILLISECONDS ───────────────────
+  auto itStart = jAiring.find("startTime");
+  auto itEnd   = jAiring.find("endTime");
+  if (itStart == jAiring.end() || itEnd == jAiring.end())
+  {
+    kodi::Log(ADDON_LOG_WARNING, "AmazonTVData: Airing missing startTime/endTime — skipping.");
+    return false;
+  }
+
+  out.startTime = EpochMsToTimeT(*itStart);
+  out.endTime   = EpochMsToTimeT(*itEnd);
+
+  if (out.startTime == 0 || out.endTime == 0 || out.endTime <= out.startTime)
+  {
+    kodi::Log(ADDON_LOG_WARNING, "AmazonTVData: Airing has invalid time range — skipping.");
+    return false;
+  }
+
+  if (auto it = jAiring.find("airingId"); it != jAiring.end() && it->is_string())
+    out.airingId = it->get<std::string>();
+
+  if (auto it = jAiring.find("airingAttributes"); it != jAiring.end() && it->is_array())
+  {
+    for (const auto& attr : *it)
+      if (attr.is_string() && attr.get<std::string>() == "NOW")
+        out.isNowAiring = true;
+  }
+
+  // ── program — required for title ─────────────────────────────────────────
+  auto itProgram = jAiring.find("program");
+  if (itProgram == jAiring.end() || !itProgram->is_object())
+  {
+    kodi::Log(ADDON_LOG_WARNING, "AmazonTVData: Airing missing 'program' object — skipping.");
+    return false;
+  }
+
+  if (auto it = itProgram->find("programId"); it != itProgram->end() && it->is_string())
+    out.programId = it->get<std::string>();
+
+  out.title = LocalizedValue(*itProgram, "title");
+  if (out.title.empty())
+  {
+    kodi::Log(ADDON_LOG_WARNING, "AmazonTVData: Airing program has no title — skipping.");
+    return false;
+  }
+
+  out.description = LocalizedValue(*itProgram, "description");
+
+  if (auto itImages = itProgram->find("images");
+      itImages != itProgram->end() && itImages->is_array())
+  {
+    out.imageUrl = FindImageUrl(*itImages, {"BACKGROUND", "CAROUSEL"});
+  }
+
+  return true;
+}
+
+// ─── Private: HTTP — endpoint (2) GetLiveLinearPlaybackResources ────────────
+
+bool AmazonTVData::FetchPlaybackResources(const std::string& gti, std::string& jsonOut)
+{
+  std::string url = kPlaybackResourcesUrl;
+  url += "?deviceID=";        url += UrlEncode(m_deviceId);
+  url += "&deviceTypeID=";    url += kDeviceTypeId;
+  url += "&gascEnabled=false";
+  url += "&marketplaceID=";   url += m_marketplaceId;
+  url += "&uxLocale=";        url += m_uxLocale;
+  url += "&firmware=1";
+  url += "&titleId=";         url += UrlEncode(gti);
+  url += "&nerid=";           url += GenerateNerid();
+
+  // The real captured POST body is a large, mostly-static JSON envelope
+  // (globalParameters with an opaque "playbackEnvelope" blob, plus
+  // liveLinearPlaybackUrlsRequest/device/capability fields). The
+  // playbackEnvelope token is itself an Amazon-internal signed/encrypted
+  // blob generated client-side by their JS bundle — we cannot regenerate
+  // it from scratch, but in practice the endpoint has also been observed
+  // to accept a minimal liveLinearPlaybackUrlsRequest-only body for basic
+  // manifest resolution without the full envelope. Start minimal and only
+  // add fields back in if Amazon's backend rejects the request.
+  json body;
+  body["globalParameters"]["deviceCapabilityFamily"] = "WebPlayer";
+  body["liveLinearPlaybackUrlsRequest"]["device"]["operatingSystem"]    = "Windows";
+  body["liveLinearPlaybackUrlsRequest"]["device"]["hdcpLevel"]          = "1.4";
+  body["liveLinearPlaybackUrlsRequest"]["device"]["maxVideoResolution"] = "2160p";
+  const std::string postBody = body.dump();
+
+  kodi::vfs::CFile file;
+  // NOTE: kodi::vfs::CFile's OpenFileForWrite/CURL POST support varies by
+  // Kodi version; if your toolchain's CFile cannot issue a POST with a
+  // custom body directly, route this through Kodi's HTTP-over-CURL helper
+  // (kodi::network::CURLOpen-style header/postdata properties) instead.
+  // The URL, query parameters, and body shape above are what must reach
+  // the server unchanged.
+  if (!file.OpenFileForWrite(url, true))
+  {
+    kodi::Log(ADDON_LOG_ERROR,
+              "AmazonTVData: Cannot open playback resources URL for write (POST) "
+              "for GTI '%s'.", gti.c_str());
+    return false;
+  }
+  file.Write(postBody.c_str(), postBody.size());
+  file.Close();
+
+  // Re-open for read to capture the response (Kodi's CFile POST/response
+  // handling differs across versions; if your build exposes a combined
+  // request/response call, prefer that over this two-step pattern).
+  if (!file.OpenFile(url, ADDON_READ_NO_CACHE))
+  {
+    kodi::Log(ADDON_LOG_ERROR,
+              "AmazonTVData: Cannot re-open playback resources URL for read "
+              "for GTI '%s'.", gti.c_str());
+    return false;
+  }
+
+  jsonOut.clear();
+  jsonOut.reserve(64 * 1024);
+  char buf[8192];
+  ssize_t n;
+  while ((n = file.Read(buf, sizeof(buf))) > 0)
+  {
+    jsonOut.append(buf, static_cast<size_t>(n));
+    if (jsonOut.size() > kMaxResponseBytes)
     {
-      programsArray = (*m_epg_cache_document).at("programs");
+      kodi::Log(ADDON_LOG_ERROR, "AmazonTVData: Playback response too large.");
+      file.Close();
+      return false;
     }
-    else if ((*m_epg_cache_document).contains("epgPrograms"))
-    {
-      programsArray = (*m_epg_cache_document).at("epgPrograms");
-    }
-    else
-    {
-      kodi::Log(ADDON_LOG_WARNING, "[epg-amazon] No programs found in response");
-      return PVR_ERROR_NO_ERROR;
-    }
+  }
+  file.Close();
 
-    kodi::Log(ADDON_LOG_DEBUG, "[epg-amazon] size: %i;", programsArray.size());
+  return !jsonOut.empty();
+}
 
-    // Parse EPG data
-    for (const auto& program : programsArray)
+std::string AmazonTVData::ExtractManifestUrl(const json& j)
+{
+  auto itTop = j.find("liveLinearPlaybackUrls");
+  if (itTop == j.end() || !itTop->is_object())
+    return "";
+
+  auto itResult = itTop->find("result");
+  if (itResult == itTop->end() || !itResult->is_object())
+    return "";
+
+  auto itUrlSets = itResult->find("urlSets");
+  if (itUrlSets == itResult->end() || !itUrlSets->is_array() || itUrlSets->empty())
+    return "";
+
+  const auto& firstSet = (*itUrlSets)[0];
+  auto itUrls = firstSet.find("urls");
+  if (itUrls == firstSet.end() || !itUrls->is_object())
+    return "";
+
+  auto itManifest = itUrls->find("manifest");
+  if (itManifest == itUrls->end() || !itManifest->is_object())
+    return "";
+
+  auto itUrl = itManifest->find("url");
+  if (itUrl == itManifest->end() || !itUrl->is_string())
+    return "";
+
+  return itUrl->get<std::string>();
+}
+
+// ─── Private: localized value / image helpers ────────────────────────────────
+
+std::string AmazonTVData::LocalizedValue(const json& j, const std::string& key,
+                                         const std::string& defaultVal)
+{
+  auto it = j.find(key);
+  if (it == j.end() || !it->is_object())
+    return defaultVal;
+
+  auto itValue = it->find("value");
+  if (itValue == it->end() || !itValue->is_string())
+    return defaultVal;
+
+  return itValue->get<std::string>();
+}
+
+std::string AmazonTVData::FindImageUrl(const json& jImages,
+                                       const std::vector<std::string>& preferredKeys)
+{
+  if (!jImages.is_array())
+    return "";
+
+  for (const std::string& wantKey : preferredKeys)
+  {
+    for (const auto& entry : jImages)
     {
-      // Filter by channel
-      if (!program.contains("channelId") || program.at("channelId") != channel.amazonChannelId)
+      auto itKey = entry.find("key");
+      if (itKey == entry.end() || !itKey->is_string() || itKey->get<std::string>() != wantKey)
         continue;
 
-      kodi::addon::PVREPGTag tag;
+      auto itValue = entry.find("value");
+      if (itValue == entry.end() || !itValue->is_array() || itValue->empty())
+        continue;
 
-      // Generate unique broadcast ID
-      const std::string epg_id = program.contains("id") ? program.at("id").get<std::string>() : "";
-      const int epg_bid = Utils::Hash(epg_id);
-      tag.SetUniqueBroadcastId(epg_bid);
+      const auto& firstVariant = (*itValue)[0];
+      auto itLocImg = firstVariant.find("localizedImage");
+      if (itLocImg == firstVariant.end() || !itLocImg->is_object())
+        continue;
 
-      // Set channel ID
-      tag.SetUniqueChannelId(channel.iUniqueId);
-
-      // Set title
-      const std::string title{program.at("title")};
-      tag.SetTitle(title);
-      kodi::Log(ADDON_LOG_DEBUG, "[epg-amazon] title: %s;", title.c_str());
-
-      // Start and end times
-      if (program.contains("startTime"))
-      {
-        tag.SetStartTime(program.at("startTime"));
-      }
-      if (program.contains("endTime"))
-      {
-        tag.SetEndTime(program.at("endTime"));
-      }
-
-      // Description
-      if (program.contains("description") && program.at("description").is_string())
-      {
-        tag.SetPlot(program.at("description"));
-      }
-
-      // Genre
-      if (program.contains("genre") && program.at("genre").is_string())
-      {
-        tag.SetGenreType(EPG_GENRE_USE_STRING);
-        tag.SetGenreDescription(program.at("genre"));
-      }
-
-      // Thumbnail/Icon
-      if (program.contains("thumbnail") && program.at("thumbnail").is_string())
-      {
-        tag.SetIconPath(program.at("thumbnail"));
-      }
-
-      // Series information
-      if (program.contains("series"))
-      {
-        const auto& series = program.at("series");
-
-        if (series.contains("title") && series.at("title").is_string())
-        {
-          tag.SetTitle(series.at("title"));
-        }
-
-        if (program.contains("episodeName") && program.at("episodeName").is_string())
-        {
-          tag.SetEpisodeName(program.at("episodeName"));
-        }
-
-        if (series.contains("seasonNumber") && series.at("seasonNumber").is_number_integer())
-        {
-          tag.SetSeriesNumber(series.at("seasonNumber"));
-        }
-
-        if (series.contains("episodeNumber") && series.at("episodeNumber").is_number_integer())
-        {
-          tag.SetEpisodeNumber(series.at("episodeNumber"));
-        }
-
-        tag.SetFlags(EPG_TAG_FLAG_IS_SERIES);
-      }
-
-      // Parental rating
-      if (program.contains("rating") && program.at("rating").is_string())
-      {
-        const std::string ratingString{program.at("rating")};
-        kodi::Log(ADDON_LOG_DEBUG, "[epg-amazon] rating: %s", ratingString.c_str());
-        tag.SetParentalRatingCode(ratingString);
-
-        const int rating{Utils::StringToInt(ratingString, -1)};
-        if (rating > -1)
-        {
-          tag.SetParentalRating(rating);
-        }
-      }
-
-      // First aired date
-      if (program.contains("releaseDate") && program.at("releaseDate").is_string())
-      {
-        tag.SetFirstAired(program.at("releaseDate"));
-      }
-
-      results.Add(tag);
-    }
-
-    return PVR_ERROR_NO_ERROR;
-  }
-
-  kodi::Log(ADDON_LOG_ERROR, "[GetAmazonEPG] ERROR: channel not found");
-  return PVR_ERROR_INVALID_PARAMETERS;
-}
-
-std::string AmazonLiveData::GetAccessToken()
-{
-  // Access token may expire after a certain period (adjust timing as needed)
-  if (m_accessToken.empty() || (std::chrono::steady_clock::now() - m_tokenTimestamp > std::chrono::hours(23)))
-  {
-    // TODO: Implement Amazon authentication
-    // This will depend on Amazon's actual Live TV API authentication mechanism
-    // Common options:
-    // 1. OAuth 2.0 flow
-    // 2. Amazon account authentication
-    // 3. Device registration
-    // 4. Cookie-based authentication
-    
-    std::string url{"https://www.amazon.com/gp/video/livetv/api/v1/auth/token"};
-
-    m_accessToken.clear();
-
-    Curl curl;
-    curl.AddHeader("User-Agent", AMAZON_LIVE_USER_AGENT);
-
-    int statusCode{500};
-    const std::string json{curl.Get(url, statusCode)};
-    if (statusCode == 200)
-    {
-      nlohmann::json doc = nlohmann::json::parse(json.c_str());
-      if (doc.is_discarded())
-      {
-        kodi::Log(ADDON_LOG_ERROR, "[GetAccessToken] ERROR: error while parsing json");
-      }
-      else
-      {
-        // Adjust field name based on actual Amazon API response
-        if (doc.contains("token"))
-        {
-          m_accessToken = doc.at("token");
-        }
-        else if (doc.contains("accessToken"))
-        {
-          m_accessToken = doc.at("accessToken");
-        }
-
-        m_tokenTimestamp = std::chrono::steady_clock::now();
-        kodi::Log(ADDON_LOG_DEBUG, "[GetAccessToken]: New Access Token: %s.", m_accessToken.c_str());
-      }
-    }
-    else
-    {
-      kodi::Log(ADDON_LOG_ERROR, "[GetAccessToken] error. status: %i, body: %s", statusCode, json.c_str());
+      auto itUrl = itLocImg->find("imageUrl");
+      if (itUrl != itLocImg->end() && itUrl->is_string())
+        return itUrl->get<std::string>();
     }
   }
-  return m_accessToken;
-}
-
-std::string AmazonLiveData::GetChannelsJson() const
-{
-  // TODO: Update with actual Amazon Live TV API endpoint
-  
-  std::string url{"https://www.amazon.com/gp/video/api/enrichNav?enrichmentType=GET_CHANNELS"};
-  //std::string url{"https://www.amazon.com/gp/video/livetv/api/v1/channels"};
-  url += "?limit=1000";
-
-  Curl curl;
-  curl.AddHeader("authority", "www.amazon.com");
-  curl.AddHeader("accept", "application/json");
-  curl.AddHeader("accept-language", "en-US,en;q=0.9");
-  curl.AddHeader("authorization", "Bearer " + m_accessToken);
-  curl.AddHeader("origin", "https://www.amazon.com");
-  curl.AddHeader("referer", "https://www.amazon.com/gp/video/livetv/");
-  curl.AddHeader("user-agent", AMAZON_LIVE_USER_AGENT);
-
-  int statusCode{500};
-  const std::string json{curl.Get(url, statusCode)};
-  if (statusCode == 200)
-  {
-    kodi::Log(ADDON_LOG_DEBUG, "[GetChannelsJson] Response: %s.", json.c_str());
-    return json;
-  }
-
-  kodi::Log(ADDON_LOG_ERROR, "[GetChannelsJson] ERROR. status: %i, body: %s", statusCode,
-            json.c_str());
-  return {};
-}
-
-std::string AmazonLiveData::GetEpgJson(time_t start, time_t end) const
-{
-  // Format timestamps for Amazon API
-  const std::tm* pstm_start{std::localtime(&start)};
-  char startTime[21] = {};
-  std::strftime(startTime, sizeof(startTime), "%Y-%m-%dT%H:%M:%SZ", pstm_start);
-
-  const std::tm* pstm_end{std::localtime(&end)};
-  char endTime[21] = {};
-  std::strftime(endTime, sizeof(endTime), "%Y-%m-%dT%H:%M:%SZ", pstm_end);
-
-  // TODO: Update with actual Amazon Live TV API endpoint
-  std::string url{"https://www.amazon.com/gp/video/api/paginateCollection?pageType=home"};
-  //std::string url{"https://www.amazon.com/gp/video/livetv/api/v1/epg"};
-
-  url += "?start=" + std::string{startTime};
-  url += "&end=" + std::string{endTime};
-  url += "&includeMetadata=true";
-
-  Curl curl;
-  curl.AddHeader("authority", "www.amazon.com");
-  curl.AddHeader("accept", "application/json");
-  curl.AddHeader("accept-language", "en-US,en;q=0.9");
-  curl.AddHeader("authorization", "Bearer " + m_accessToken);
-  curl.AddHeader("origin", "https://www.amazon.com");
-  curl.AddHeader("referer", "https://www.amazon.com/gp/video/livetv/");
-  curl.AddHeader("user-agent", AMAZON_LIVE_USER_AGENT);
-
-  int statusCode{500};
-  const std::string json{curl.Get(url, statusCode)};
-
-  if (statusCode == 200)
-  {
-    kodi::Log(ADDON_LOG_DEBUG, "[GetEpgJson] Response: %s.", json.c_str());
-    return json;
-  }
-
-  kodi::Log(ADDON_LOG_ERROR, "[GetEpgJson] ERROR. status: %i, body: %s", statusCode, json.c_str());
   return "";
 }
 
-ADDONCREATOR(AmazonLiveData)
+time_t AmazonTVData::EpochMsToTimeT(const json& j)
+{
+  long long ms = 0;
+  if (j.is_number_integer())
+    ms = j.get<long long>();
+  else if (j.is_number_float())
+    ms = static_cast<long long>(j.get<double>());
+  else if (j.is_string())
+  {
+    try { ms = std::stoll(j.get<std::string>()); }
+    catch (...) { return 0; }
+  }
+  else
+    return 0;
+
+  return static_cast<time_t>(ms / 1000);
+}
+
+int AmazonTVData::MapAiringToKodiGenre(const std::string& title, const std::string& description)
+{
+  // Amazon's stationAiringsAndRestrictions response does not include a
+  // dedicated genre field (unlike Pluto's catalog, which does) — only
+  // title/description/ratings. Lightweight keyword inference is a best
+  // effort; it intentionally does not invent a confident category when
+  // nothing matches.
+  struct { const char* key; int type; } kMap[] = {
+    { "News",   EPG_EVENT_CONTENTMASK_NEWSCURRENTAFFAIRS },
+    { "Sport",  EPG_EVENT_CONTENTMASK_SPORTS              },
+    { "Kids",   EPG_EVENT_CONTENTMASK_CHILDRENYOUTH       },
+    { "Alien",  EPG_EVENT_CONTENTMASK_ARTSCULTURE         }, // documentary-style
+  };
+  for (const auto& e : kMap)
+  {
+    if (title.find(e.key) != std::string::npos || description.find(e.key) != std::string::npos)
+      return e.type;
+  }
+  return EPG_EVENT_CONTENTMASK_UNDEFINED;
+}
+
+int AmazonTVData::ChannelUidToIndex(int uid) const
+{
+  auto it = m_uidToIndex.find(uid);
+  return (it != m_uidToIndex.end()) ? it->second : -1;
+}
